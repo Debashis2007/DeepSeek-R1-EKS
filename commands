@@ -1,0 +1,85 @@
+# Installing kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# Install Terraform
+sudo yum install -y yum-utils
+sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+sudo yum -y install terraform
+
+# Clone the GitHub repo with the manifests
+git clone https://github.com/aws-samples/deepseek-using-vllm-on-eks
+cd deepseek-using-vllm-on-eks
+
+# Apply the Terraform configuration
+terraform init
+terraform apply
+
+# Type 'yes' and press Enter to confirm the deployment.
+
+# After Terraform finishes, configure kubectl with the new EKS cluster
+$(terraform output configure_kubectl | jq -r)
+
+# Create a custom NodePool with GPU support
+kubectl apply -f manifests/gpu-nodepool.yaml
+
+# Check if the NodePool is in 'Ready' state
+kubectl get nodepool/gpu-nodepool
+
+# Use the sed command to replace the placeholder with the model name and configuration parameters
+sed -i "s|__MODEL_NAME_AND_PARAMETERS__|deepseek-ai/DeepSeek-R1-Distill-Llama-8B --max_model 2048|g" manifests/deepseek-deployment-gpu.yaml
+
+# Deploy the DeepSeek model on Kubernetes
+kubectl apply -f manifests/deepseek-deployment-gpu.yaml
+
+# Check the pods in the 'deepseek' namespace 
+kubectl get po -n deepseek
+
+# Wait for the pod to reach the 'Running' state
+watch -n 1 kubectl get po -n deepseek
+
+# Verify that a new Node has been created
+kubectl get nodes -l owner=data-engineer
+
+# Check the logs to confirm that vLLM has started
+kubectl logs deployment.apps/deepseek-deployment -n deepseek
+
+# Set up a proxy to forward the service port to your local terminal
+kubectl port-forward svc/deepseek-svc -n deepseek 8080:80 > port-forward.log 2>&1 &
+
+# Send a curl request to the model
+curl -X POST "http://localhost:8080/v1/chat/completions" -H "Content-Type: application/json" -
+-data '{
+ "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+ "messages": [
+ {
+ "role": "user",
+ "content": "What is Kubernetes?"
+ }
+ ]
+ }'
+
+# Retrieve the ECR repository URI created by Terraform
+export ECR_REPO=$(terraform output ecr_repository_uri | jq -r)
+
+# Build the container image for the Chatbot UI
+docker build -t $ECR_REPO:0.1 chatbot-ui/application/.
+
+# Login to ECR and push the image
+aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+docker push $ECR_REPO:0.1
+
+# Update the deployment manifest to use the image
+sed -i "s#__IMAGE_DEEPSEEK_CHATBOT__#$ECR_REPO:0.1#g" chatbot-ui/manifests/deployment.yaml
+
+# Generate a random password for the Chatbot UI login
+sed -i "s|__PASSWORD__|$(openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c 16)|" chatbot-ui/manifests/deployment.yaml
+
+# Deploy the UI and create the ingress class required for load balancers
+kubectl apply -f chatbot-ui/manifests/ingress-class.yaml
+kubectl apply -f chatbot-ui/manifests/deployment.yaml
+
+# Get the URL for the load balancer to access the application
+echo http://$(kubectl get ingress/deepseek-chatbot-ingress -n deepseek -o json | jq -r '.status.loadBalancer.ingress[0].hostname')
+
+echo -e "Username=$(kubectl get secret deepseek-chatbot-secrets -n deepseek -o jsonpath='{.data.admin-username}' | base64 --decode)\nPassword=$(kubectl get secret deepseek-chatbot-secrets -n deepseek -o jsonpath='{.data.admin-password}' | base64 --decode)"
